@@ -55,6 +55,7 @@ const state = {
   isListening:      false,
   isSpeaking:       false,
   restartTimeout:   null,
+  vadActive:        false,
 
   captionLines:    [],   // [{ el, timer }]
   interimEl:       null,
@@ -87,6 +88,7 @@ async function init() {
 
   setupWebSocket();
   setupSpeechRecognition();
+  setupPushToTalk();    // PTT button wired up after DOM ready
   setupUIHandlers();
   checkXRSupport();
   updatePhoneUrlHint();
@@ -209,16 +211,13 @@ function handleWsMessage(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SPEECH RECOGNITION
+// SPEECH — PRIMARY: Web Speech API
 // ═══════════════════════════════════════════════════════════════════════════
 function setupSpeechRecognition() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
-    state.speechSupported = false;
-    console.warn('[Speech] Web Speech API not supported — using text input fallback.');
-    $('text-input-fallback').classList.add('visible');
-    $('mic-indicator').classList.add('off');
-    setupTextInputFallback();
+    console.warn('[Speech] Web Speech API unavailable — using MediaRecorder fallback.');
+    initMediaRecorderFallback();
     return;
   }
   state.speechSupported = true;
@@ -232,75 +231,58 @@ function setupSpeechRecognition() {
   rec.onstart = () => {
     state.isListening = true;
     $('mic-indicator').className = 'active';
+    $('ptt-btn') && ($('ptt-btn').style.display = 'none');
   };
 
   rec.onresult = (evt) => {
     let interim = '';
     let final   = '';
-
     for (let i = evt.resultIndex; i < evt.results.length; i++) {
       const t = evt.results[i][0].transcript.trim();
       if (evt.results[i].isFinal) final  += ' ' + t;
       else                         interim += ' ' + t;
     }
-
     interim = interim.trim();
     final   = final.trim();
-
     if (interim) showInterimCaption(interim);
-
     if (final) {
       clearInterimCaption();
-      if (state.settings.captions) {
-        addCaptionLine(final, 'self');
-      }
-      if (state.settings.topic) feedTopicBuffer(final);
-
-      // Send to server for translation to phone
-      if (!state.standalone) {
-        wsSend({ type: 'speech', text: final, isFinal: true });
-      }
+      if (state.settings.captions) addCaptionLine(final, 'self');
+      if (state.settings.topic)    feedTopicBuffer(final);
+      if (!state.standalone)       wsSend({ type: 'speech', text: final, isFinal: true });
     }
   };
 
   rec.onerror = (evt) => {
-    // 'no-speech' is normal — just restart
-    if (evt.error === 'not-allowed' || evt.error === 'service-not-allowed') {
+    console.warn('[Speech] Error:', evt.error);
+    if (evt.error === 'service-not-allowed' || evt.error === 'not-allowed') {
+      // Quest Browser doesn't have Google's speech service → switch to
+      // getUserMedia + MediaRecorder + server-side Whisper transcription.
+      console.warn('[Speech] Service unavailable — switching to MediaRecorder fallback.');
       state.speechSupported = false;
-      $('text-input-fallback').classList.add('visible');
-      setupTextInputFallback();
-      showToast('Mic access denied — using text input');
-      return;
+      state.isListening     = false;
+      try { rec.abort(); } catch {}
+      initMediaRecorderFallback();
     }
-    if (evt.error !== 'no-speech') {
-      console.warn('[Speech] Error:', evt.error);
-    }
+    // 'no-speech' is benign; auto-restart handles it via onend.
   };
 
   rec.onend = () => {
     state.isSpeaking = false;
     $('mic-indicator').className = state.isListening ? 'active' : 'off';
-    // Auto-restart
-    if (state.isListening) {
-      state.restartTimeout = setTimeout(() => {
-        try { rec.start(); } catch {}
-      }, 150);
+    if (state.isListening && state.speechSupported) {
+      state.restartTimeout = setTimeout(() => { try { rec.start(); } catch {} }, 150);
     }
   };
 
-  rec.onspeechstart = () => {
-    state.isSpeaking = true;
-    $('mic-indicator').className = 'speaking';
-  };
-  rec.onspeechend = () => {
-    state.isSpeaking = false;
-    $('mic-indicator').className = state.isListening ? 'active' : 'off';
-  };
+  rec.onspeechstart = () => { state.isSpeaking = true;  $('mic-indicator').className = 'speaking'; };
+  rec.onspeechend   = () => { state.isSpeaking = false; $('mic-indicator').className = state.isListening ? 'active' : 'off'; };
 
   state.recognition = rec;
 }
 
 function startListening() {
+  if (state.vadActive) return; // VAD fallback is running
   if (!state.speechSupported || !state.recognition) return;
   state.isListening = true;
   state.recognition.lang = LANGUAGES[state.headsetLang]?.speech || 'en-US';
@@ -310,7 +292,8 @@ function startListening() {
 function stopListening() {
   state.isListening = false;
   clearTimeout(state.restartTimeout);
-  try { state.recognition.stop(); } catch {}
+  try { state.recognition?.stop(); } catch {}
+  stopVAD();
   $('mic-indicator').className = 'off';
 }
 
@@ -319,10 +302,215 @@ function restartRecognition() {
   setTimeout(startListening, 300);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SPEECH — FALLBACK: getUserMedia + MediaRecorder + VAD + Whisper
+// Used on Meta Quest Browser where webkitSpeechRecognition is unavailable.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Shared state for the fallback pipeline
+const vad = {
+  stream:      null,
+  audioCtx:    null,
+  analyser:    null,
+  recorder:    null,
+  chunks:      [],
+  recording:   false,
+  silenceTimer: null,
+  rafId:       null,
+  mimeType:    '',
+};
+
+async function initMediaRecorderFallback() {
+  // Show the push-to-talk button (always visible as manual option)
+  const pttBtn = $('ptt-btn');
+  if (pttBtn) pttBtn.style.display = 'flex';
+
+  // Request mic access
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  } catch (err) {
+    console.error('[VAD] getUserMedia failed:', err);
+    // Last resort: show text input
+    $('text-input-fallback').classList.add('visible');
+    setupTextInputFallback();
+    showToast('Mic unavailable — use text input');
+    return;
+  }
+
+  vad.stream   = stream;
+  vad.mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus'
+               : MediaRecorder.isTypeSupported('audio/webm')              ? 'audio/webm'
+               : 'audio/ogg;codecs=opus';
+
+  // Set up AudioContext analyser for Voice Activity Detection
+  vad.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const src    = vad.audioCtx.createMediaStreamSource(stream);
+  vad.analyser = vad.audioCtx.createAnalyser();
+  vad.analyser.fftSize          = 512;
+  vad.analyser.smoothingTimeConstant = 0.6;
+  src.connect(vad.analyser);
+
+  state.vadActive = true;
+  $('mic-indicator').className = 'active';
+  showToast('Auto-mic active (Quest mode)');
+  runVAD();
+}
+
+const VAD_THRESHOLD     = 18;   // energy level that counts as speech
+const VAD_SILENCE_MS    = 1200; // ms of silence before cutting a segment
+const VAD_MIN_SPEECH_MS = 400;  // ignore very short bursts (< 0.4s)
+const VAD_MAX_RECORD_MS = 12000;// safety cap per segment
+
+function runVAD() {
+  const data = new Uint8Array(vad.analyser.frequencyBinCount);
+
+  function tick() {
+    if (!state.vadActive) return;
+    vad.rafId = requestAnimationFrame(tick);
+
+    vad.analyser.getByteFrequencyData(data);
+    // Focus on speech frequencies (~80 Hz – 3 kHz)
+    const lo  = Math.floor(80  / (vad.audioCtx.sampleRate / vad.analyser.fftSize));
+    const hi  = Math.floor(3000 / (vad.audioCtx.sampleRate / vad.analyser.fftSize));
+    let   sum = 0;
+    for (let i = lo; i <= hi; i++) sum += data[i];
+    const avg = sum / (hi - lo + 1);
+
+    if (avg > VAD_THRESHOLD) {
+      // Voice detected
+      $('mic-indicator').className = 'speaking';
+      if (!vad.recording) startVADRecording();
+      clearTimeout(vad.silenceTimer);
+      vad.silenceTimer = setTimeout(stopVADRecording, VAD_SILENCE_MS);
+    } else if (!vad.recording) {
+      $('mic-indicator').className = 'active';
+    }
+  }
+  tick();
+}
+
+function startVADRecording() {
+  if (vad.recording) return;
+  vad.recording = true;
+  vad.chunks    = [];
+  vad.recorder  = new MediaRecorder(vad.stream, { mimeType: vad.mimeType });
+
+  vad.recorder.ondataavailable = (e) => { if (e.data.size > 0) vad.chunks.push(e.data); };
+  vad.recorder.onstop          = onVADSegmentReady;
+  vad.recorder.start(100); // collect data every 100ms
+
+  // Safety: stop if recording runs too long
+  vad.maxTimer = setTimeout(stopVADRecording, VAD_MAX_RECORD_MS);
+}
+
+function stopVADRecording() {
+  if (!vad.recording || !vad.recorder) return;
+  clearTimeout(vad.maxTimer);
+  vad.recording = false;
+  try { vad.recorder.stop(); } catch {}
+  $('mic-indicator').className = 'active';
+}
+
+async function onVADSegmentReady() {
+  if (!vad.chunks.length) return;
+  const blob = new Blob(vad.chunks, { type: vad.mimeType });
+  vad.chunks = [];
+
+  // Ignore very short clips (likely noise)
+  if (blob.size < 2000) return;
+
+  showInterimCaption('Transcribing…');
+  const text = await sendAudioForTranscription(blob, vad.mimeType);
+  clearInterimCaption();
+
+  if (text && text.trim().length > 1) {
+    if (state.settings.captions) addCaptionLine(text, 'self');
+    if (state.settings.topic)    feedTopicBuffer(text);
+    if (!state.standalone)       wsSend({ type: 'speech', text: text.trim(), isFinal: true });
+  }
+}
+
+async function sendAudioForTranscription(blob, mimeType) {
+  try {
+    const lang = (LANGUAGES[state.headsetLang]?.speech || 'en-US').split('-')[0];
+    const res  = await fetch('/api/transcribe', {
+      method:  'POST',
+      headers: { 'Content-Type': mimeType, 'X-Lang': lang },
+      body:    blob,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      if (err.error === 'no_key') {
+        showToast('Set OPENAI_API_KEY on server for Quest mic');
+      }
+      return '';
+    }
+    const { text } = await res.json();
+    return text || '';
+  } catch (e) {
+    console.error('[Transcribe]', e);
+    return '';
+  }
+}
+
+// Push-to-talk: manual recording (bypasses VAD, useful in noisy environments)
+function setupPushToTalk() {
+  const btn = $('ptt-btn');
+  if (!btn) return;
+
+  let pttRecorder = null;
+  let pttChunks   = [];
+
+  function startPTT() {
+    if (!vad.stream) return;
+    pttChunks   = [];
+    pttRecorder = new MediaRecorder(vad.stream, { mimeType: vad.mimeType || 'audio/webm' });
+    pttRecorder.ondataavailable = (e) => { if (e.data.size > 0) pttChunks.push(e.data); };
+    pttRecorder.onstop = async () => {
+      const blob = new Blob(pttChunks, { type: vad.mimeType || 'audio/webm' });
+      pttChunks  = [];
+      showInterimCaption('Transcribing…');
+      const text = await sendAudioForTranscription(blob, vad.mimeType || 'audio/webm');
+      clearInterimCaption();
+      if (text?.trim()) {
+        if (state.settings.captions) addCaptionLine(text, 'self');
+        if (state.settings.topic)    feedTopicBuffer(text);
+        if (!state.standalone)       wsSend({ type: 'speech', text: text.trim(), isFinal: true });
+      }
+    };
+    pttRecorder.start();
+    btn.classList.add('recording');
+    btn.textContent = '⏹ Release';
+    $('mic-indicator').className = 'speaking';
+  }
+
+  function stopPTT() {
+    if (pttRecorder?.state === 'recording') pttRecorder.stop();
+    btn.classList.remove('recording');
+    btn.textContent = '🎙 Hold to Speak';
+    $('mic-indicator').className = 'active';
+  }
+
+  btn.addEventListener('pointerdown', (e) => { e.preventDefault(); startPTT(); });
+  btn.addEventListener('pointerup',   (e) => { e.preventDefault(); stopPTT();  });
+  btn.addEventListener('pointerleave',(e) => { e.preventDefault(); stopPTT();  });
+}
+
+function stopVAD() {
+  state.vadActive = false;
+  cancelAnimationFrame(vad.rafId);
+  clearTimeout(vad.silenceTimer);
+  if (vad.recorder?.state === 'recording') { try { vad.recorder.stop(); } catch {} }
+  if (vad.audioCtx) { try { vad.audioCtx.close(); } catch {} }
+  if (vad.stream)   vad.stream.getTracks().forEach((t) => t.stop());
+  vad.recording = false;
+}
+
+// ── Text input last-resort fallback ───────────────────────────────────────
 function setupTextInputFallback() {
   const input = $('fallback-input');
   const send  = $('fallback-send');
-
   function submitText() {
     const text = input.value.trim();
     if (!text) return;
@@ -331,7 +519,6 @@ function setupTextInputFallback() {
     if (state.settings.topic)    feedTopicBuffer(text);
     if (!state.standalone)       wsSend({ type: 'speech', text, isFinal: true });
   }
-
   send.addEventListener('click', submitText);
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitText(); });
 }
@@ -488,16 +675,21 @@ async function checkXRSupport() {
 }
 
 async function enterAR() {
-  // If no real XR support, just show the overlay in browser mode
+  const overlayRoot = $('ar-overlay');
+
+  // ── CRITICAL: the dom-overlay root MUST be in the render tree (display:block)
+  // before requestSession() is called. Quest Browser rejects the session if the
+  // root element is hidden (display:none), which was causing the black screen.
+  overlayRoot.style.display    = 'block';
+  overlayRoot.style.visibility = 'hidden'; // in layout but not painted yet
+
   if (!state.xrSupported || !navigator.xr) {
-    $('setup-screen').style.display = 'none';
-    $('ar-overlay').style.display   = 'block';
+    $('setup-screen').style.display  = 'none';
+    overlayRoot.style.visibility     = 'visible';
     document.body.classList.add('xr-active');
     startListening();
     return;
   }
-
-  const overlayRoot = $('ar-overlay');
 
   try {
     state.xrSession = await navigator.xr.requestSession('immersive-ar', {
@@ -505,10 +697,10 @@ async function enterAR() {
       domOverlay:       { root: overlayRoot },
     });
   } catch (err) {
-    console.error('[XR] Session failed:', err);
-    showToast('Could not start AR session — opening in browser mode');
-    $('setup-screen').style.display = 'none';
-    $('ar-overlay').style.display   = 'block';
+    console.error('[XR] Session failed:', err.name, err.message);
+    showToast(`AR failed (${err.name}) — browser mode`);
+    $('setup-screen').style.display  = 'none';
+    overlayRoot.style.visibility     = 'visible';
     document.body.classList.add('xr-active');
     startListening();
     return;
@@ -559,12 +751,12 @@ async function enterAR() {
   }
 
   // Show AR overlay, hide setup.
-  // Force ALL backgrounds transparent so passthrough isn't blocked.
-  $('setup-screen').style.display         = 'none';
-  overlayRoot.style.display               = 'block';
-  overlayRoot.style.background            = 'transparent';
-  document.documentElement.style.background = 'transparent';
-  document.body.style.background          = 'transparent';
+  // Force ALL backgrounds transparent so passthrough shows through.
+  $('setup-screen').style.display            = 'none';
+  overlayRoot.style.visibility               = 'visible';
+  overlayRoot.style.background               = 'transparent';
+  document.documentElement.style.background  = 'transparent';
+  document.body.style.background             = 'transparent';
   document.body.classList.add('xr-active');
 
   // Minimal render loop — just clear each frame (passthrough handles background)
