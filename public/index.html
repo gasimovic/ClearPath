@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#060810">
+  <title>AR Caption Companion</title>
+  <link rel="stylesheet" href="css/ar.css">
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     SETUP SCREEN  (visible before entering AR)
+     ══════════════════════════════════════════════════════════════════════════ -->
+<div id="setup-screen">
+  <div class="setup-card glass">
+
+    <!-- Logo / Title -->
+    <div class="setup-logo">
+      <div class="setup-logo-icon">🥽</div>
+      <div>
+        <h1>AR Caption Companion</h1>
+        <p>Real-time captions &amp; two-way translation</p>
+      </div>
+    </div>
+
+    <!-- HTTPS warning (shown only on HTTP) -->
+    <div id="https-warning" class="https-warning hidden">
+      ⚠️ &nbsp;<span>WebXR &amp; microphone require <strong>HTTPS</strong>.
+      Run <code>npx ngrok http 3000</code> and open the HTTPS URL on your Quest.</span>
+    </div>
+
+    <!-- Your language -->
+    <div class="setup-section">
+      <label>Your Language (Headset)</label>
+      <select id="headset-lang" class="lang-select">
+        <option value="en">🇺🇸 English</option>
+        <option value="es">🇪🇸 Spanish</option>
+        <option value="fr">🇫🇷 French</option>
+        <option value="zh">🇨🇳 Mandarin Chinese</option>
+        <option value="pt">🇧🇷 Portuguese</option>
+      </select>
+    </div>
+
+    <!-- Companion's language -->
+    <div class="setup-section">
+      <label>Companion's Language (Phone)</label>
+      <select id="phone-lang-setup" class="lang-select">
+        <option value="es">🇪🇸 Spanish</option>
+        <option value="en">🇺🇸 English</option>
+        <option value="fr">🇫🇷 French</option>
+        <option value="zh">🇨🇳 Mandarin Chinese</option>
+        <option value="pt">🇧🇷 Portuguese</option>
+      </select>
+    </div>
+
+    <!-- Room Code + QR -->
+    <div class="setup-section">
+      <label>Room Code — Share with Companion</label>
+      <div class="room-code-box">
+        <div style="flex:1">
+          <div class="room-code-label">CODE</div>
+          <div class="room-code-value" id="setup-room-code">・・・・・</div>
+        </div>
+        <div class="room-code-status waiting" id="setup-conn-status">Waiting…</div>
+      </div>
+      <div class="qr-wrapper" id="qr-wrapper">
+        <img id="qr-img" src="" alt="QR Code" style="display:none">
+        <div class="qr-hint">
+          <strong>Scan on the companion's phone</strong><br>
+          or open <span id="phone-url-hint"></span> and enter the code above.
+        </div>
+      </div>
+    </div>
+
+    <!-- Enter AR -->
+    <button id="enter-ar-btn" class="btn btn-primary btn-full" disabled>
+      <span>🥽</span> Enter AR
+    </button>
+    <button id="standalone-btn" class="btn btn-ghost btn-full">
+      <span>💬</span> Use Without Phone (Captions Only)
+    </button>
+
+  </div>
+</div>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     AR OVERLAY  (DOM-overlay root for WebXR session)
+     ══════════════════════════════════════════════════════════════════════════ -->
+<div id="ar-overlay">
+
+  <!-- ── Settings Panel — top-left ──────────────────────────────────────── -->
+  <div id="settings-panel" class="glass">
+    <div class="settings-header">Settings</div>
+
+    <div class="toggle-row">
+      <span>Captions</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggle-captions" checked>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <div class="toggle-row">
+      <span>Topic ID</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggle-topic" checked>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <div class="toggle-row">
+      <span>Haptics</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggle-haptics">
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <div class="toggle-row" style="margin-top:4px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.08)">
+      <span style="font-size:12px; color:var(--text-dim)">Exit AR</span>
+      <button id="exit-ar-btn-inline" class="btn btn-danger" style="padding:4px 10px; font-size:12px;">✕</button>
+    </div>
+  </div>
+
+  <!-- ── Connection Status — top-center ────────────────────────────────── -->
+  <div id="connection-panel" class="glass">
+    <div class="conn-dot" id="conn-dot"></div>
+    <span class="conn-text" id="conn-text">Room</span>
+    <span class="conn-sep">·</span>
+    <span class="conn-code" id="conn-code-display">-----</span>
+  </div>
+
+  <!-- ── Profile Panel — top-right ─────────────────────────────────────── -->
+  <div id="profile-panel" class="glass">
+    <div class="profile-avatar" id="profile-avatar">?</div>
+    <div class="profile-row">
+      <div class="profile-label">Person's Name</div>
+      <div class="profile-value empty" id="ar-profile-name">Not Connected</div>
+    </div>
+    <div class="profile-row">
+      <div class="profile-label">Relationship</div>
+      <div class="profile-value empty" id="ar-profile-relationship">—</div>
+    </div>
+    <div class="profile-row">
+      <div class="profile-label">Speaking</div>
+      <div class="profile-lang-badge" id="ar-profile-lang">—</div>
+    </div>
+  </div>
+
+  <!-- ── Topic Panel ────────────────────────────────────────────────────── -->
+  <div id="topic-panel">
+    <div class="glass" style="display:flex; align-items:center; gap:8px; padding:8px 16px;">
+      <span class="topic-icon" id="topic-icon">💬</span>
+      <span class="topic-label-text">Topic:</span>
+      <span class="topic-value" id="topic-value">—</span>
+    </div>
+  </div>
+
+  <!-- ── Captions Panel ─────────────────────────────────────────────────── -->
+  <div id="captions-panel" class="glass">
+    <div id="captions-container">
+      <div class="caption-line caption-interim" id="caption-placeholder"
+           style="opacity:0.4; font-style:italic; font-size:14px;">
+        Listening for speech…
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Text Input Fallback (when no Speech API) ───────────────────────── -->
+  <div id="text-input-fallback">
+    <input type="text" id="fallback-input" placeholder="Type your message…" autocomplete="off">
+    <button id="fallback-send" class="btn">Send</button>
+  </div>
+
+  <!-- ── Mic Indicator ─────────────────────────────────────────────────── -->
+  <div id="mic-indicator" class="off" title="Microphone">🎤</div>
+
+</div>
+
+<!-- Hidden canvas — required for WebXR WebGL base layer -->
+<canvas id="xr-canvas" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%;"></canvas>
+
+<!-- Toast notification -->
+<div id="toast"></div>
+
+<script src="js/ar-app.js"></script>
+</body>
+</html>
