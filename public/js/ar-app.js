@@ -517,11 +517,17 @@ async function enterAR() {
   state.xrSession.addEventListener('end', onXRSessionEnd);
 
   // Set up minimal WebGL layer
+  // Canvas must exist in DOM but doesn't need to be visible.
+  // Position off-screen so it doesn't flash over the UI.
   const canvas = $('xr-canvas');
+  canvas.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;';
   canvas.style.display = 'block';
 
-  state.gl = canvas.getContext('webgl2', { xrCompatible: true })
-           || canvas.getContext('webgl',  { xrCompatible: true });
+  // alpha:true + premultipliedAlpha:false are REQUIRED for transparent
+  // passthrough on Meta Quest 3 — without them the framebuffer is opaque black.
+  const ctxAttribs = { xrCompatible: true, alpha: true, premultipliedAlpha: false };
+  state.gl = canvas.getContext('webgl2', ctxAttribs)
+           || canvas.getContext('webgl',  ctxAttribs);
 
   if (!state.gl) {
     showToast('WebGL not available');
@@ -535,7 +541,14 @@ async function enterAR() {
     console.warn('[XR] makeXRCompatible failed:', e);
   }
 
-  const baseLayer = new XRWebGLLayer(state.xrSession, state.gl);
+  // alpha:true on the layer tells the XR compositor to blend with passthrough.
+  // antialias:false saves GPU bandwidth — we only need a transparent framebuffer.
+  const baseLayer = new XRWebGLLayer(state.xrSession, state.gl, {
+    alpha:      true,
+    antialias:  false,
+    depth:      true,
+    stencil:    false,
+  });
   state.xrSession.updateRenderState({ baseLayer });
 
   let refSpace;
@@ -545,11 +558,14 @@ async function enterAR() {
     refSpace = await state.xrSession.requestReferenceSpace('viewer');
   }
 
-  // Show AR overlay, hide setup
-  $('setup-screen').style.display = 'none';
-  overlayRoot.style.display       = 'block';
+  // Show AR overlay, hide setup.
+  // Force ALL backgrounds transparent so passthrough isn't blocked.
+  $('setup-screen').style.display         = 'none';
+  overlayRoot.style.display               = 'block';
+  overlayRoot.style.background            = 'transparent';
+  document.documentElement.style.background = 'transparent';
+  document.body.style.background          = 'transparent';
   document.body.classList.add('xr-active');
-  document.body.style.background = 'transparent';
 
   // Minimal render loop — just clear each frame (passthrough handles background)
   state.xrSession.requestAnimationFrame(function xrFrame(time, frame) {
